@@ -1987,14 +1987,14 @@ tqdm = ["tqdm"]
 
 [[package]]
 name = "gdown"
-version = "5.2.0"
+version = "5.2.2"
 description = "Google Drive Public File/Folder Downloader"
 optional = false
 python-versions = ">=3.8"
 groups = ["eval"]
 files = [
-    {file = "gdown-5.2.0-py3-none-any.whl", hash = "sha256:33083832d82b1101bdd0e9df3edd0fbc0e1c5f14c9d8c38d2a35bf1683b526d6"},
-    {file = "gdown-5.2.0.tar.gz", hash = "sha256:2145165062d85520a3cd98b356c9ed522c5e7984d408535409fd46f94defc787"},
+    {file = "gdown-5.2.2-py3-none-any.whl", hash = "sha256:e1ed2638abb931668725c79298900629b31e20f02b7c55a2685e9249edb51e09"},
+    {file = "gdown-5.2.2.tar.gz", hash = "sha256:a4bafbaa627d67bdaa68d274e9e957127ba810b4bcf4505e2b57ea45aa0aa1e6"},
 ]
 
 [package.dependencies]
