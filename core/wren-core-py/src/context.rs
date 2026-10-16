@@ -18,6 +18,7 @@
 use crate::errors::CoreError;
 use crate::manifest::to_manifest;
 use crate::remote_functions::PyRemoteFunction;
+use futures::TryStreamExt;
 use log::debug;
 use pyo3::types::{PyAnyMethods, PyFrozenSet, PyFrozenSetMethods, PyTuple};
 use pyo3::Python;
@@ -71,6 +72,14 @@ fn shared_runtime() -> PyResult<Arc<Runtime>> {
 }
 
 /// The Python wrapper for the Wren Core session context.
+///
+/// Calls on one context can run concurrently. Each `transform_sql` applies
+/// the MDL onto a private top-level catalog snapshot (see
+/// `clone_catalog_list` in wren-core's `mdl::context`), and analyzer rules
+/// keep their mutable state per invocation. See the Concurrency section in
+/// `README.md` for the supported operation contract. `load_mdl` takes
+/// `&mut self`, so PyO3's exclusive borrow rejects overlapping calls on the
+/// same context with a `RuntimeError`.
 #[pyclass(name = "SessionContext")]
 pub struct PySessionContext {
     /// Base context — physical tables are registered here.
@@ -80,16 +89,6 @@ pub struct PySessionContext {
     exec_ctx: wren_core::SessionContext,
     mdl: Arc<AnalyzedWrenMDL>,
     properties: Arc<HashMap<String, Option<String>>>,
-    /// Serializes engine calls on this context. `transform_sql` re-applies
-    /// the MDL catalog onto the context's shared catalog list on every call
-    /// (`apply_wren_on_ctx` -> `register_table_with_mdl`), while `query`,
-    /// `dry_run`, and `list_tables` read that same shared list, so two
-    /// concurrent calls on the same context can observe each other's
-    /// half-registered catalogs. The GIL used to provide this serialization
-    /// implicitly; now that the GIL is released around blocking work, keep
-    /// the same per-context ordering with a lock. Calls on *different*
-    /// contexts run in parallel.
-    call_lock: Arc<Mutex<()>>,
 }
 
 impl Hash for PySessionContext {
@@ -107,7 +106,6 @@ impl Default for PySessionContext {
             exec_ctx: ctx,
             mdl: Arc::new(AnalyzedWrenMDL::default()),
             properties: Arc::new(HashMap::new()),
-            call_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -147,7 +145,6 @@ impl PySessionContext {
                 exec_ctx: ctx,
                 mdl: Arc::new(AnalyzedWrenMDL::default()),
                 properties: Arc::new(HashMap::new()),
-                call_lock: Arc::new(Mutex::new(())),
             });
         };
 
@@ -244,7 +241,6 @@ impl PySessionContext {
                         exec_ctx,
                         mdl: analyzed_mdl,
                         properties: properties_ref,
-                        call_lock: Arc::new(Mutex::new(())),
                     })
                 }
                 Err(e) => Err(CoreError::new(
@@ -267,7 +263,6 @@ impl PySessionContext {
         let sql = sql.to_owned();
         let rt = shared_runtime()?;
         py.detach(|| {
-            let _guard = self.lock_calls();
             rt.block_on(mdl::transform_sql_with_ctx(
                 &self.ctx,
                 Arc::clone(&self.mdl),
@@ -288,10 +283,7 @@ impl PySessionContext {
     ) -> PyResult<Vec<PyRemoteFunction>> {
         let rt = shared_runtime()?;
         let registered_functions: Vec<PyRemoteFunction> = py
-            .detach(|| {
-                let _guard = self.lock_calls();
-                rt.block_on(Self::get_registered_functions(&self.exec_ctx))
-            })
+            .detach(|| rt.block_on(Self::get_registered_functions(&self.exec_ctx)))
             .map_err(CoreError::from)?
             .into_iter()
             .map(|f| f.into())
@@ -308,7 +300,6 @@ impl PySessionContext {
         let rt = shared_runtime()?;
         let functions = py
             .detach(|| {
-                let _guard = self.lock_calls();
                 rt.block_on(Self::get_registered_function(
                     &function_name,
                     &self.exec_ctx,
@@ -391,12 +382,16 @@ impl PySessionContext {
         let sql = sql.to_owned();
         let rt = shared_runtime()?;
         py.detach(|| {
-            let _guard = self.lock_calls();
             let (batches, schema) = rt
                 .block_on(async {
                     let df = self.exec_ctx.sql(&sql).await?;
-                    let schema = df.schema().inner().clone();
-                    let batches = df.collect().await?;
+                    // Write the IPC stream with the execution schema: it
+                    // matches every batch (even zero of them), while the
+                    // plan's declared MDL types can differ from the physical
+                    // types (e.g. `integer` over int64, Utf8 vs Utf8View).
+                    let stream = df.execute_stream().await?;
+                    let schema = stream.schema();
+                    let batches: Vec<_> = stream.try_collect().await?;
                     Ok::<_, wren_core::DataFusionError>((batches, schema))
                 })
                 .map_err(CoreError::from)?;
@@ -418,8 +413,18 @@ impl PySessionContext {
         })
     }
 
-    /// Register a Parquet file as a named table.
-    /// Tables registered on base_ctx are visible to exec_ctx via shared catalog.
+    /// Register a Parquet file as a named table on the base context.
+    ///
+    /// The table lands in the pre-existing default catalog
+    /// (`datafusion`.`public`), whose internals are live-shared with derived
+    /// contexts — so it is visible to `query`/`dry_run`/`list_tables` even
+    /// when the session context was created before this call. Only
+    /// pre-existing catalogs get this guarantee: derived contexts and each
+    /// `transform_sql` call snapshot *top-level* catalog membership, so new
+    /// top-level catalogs must exist before MDL construction, `load_mdl`,
+    /// or a transform. See `clone_catalog_list` in wren-core's
+    /// `mdl::context` for the exact contract. Call `load_mdl` afterward if
+    /// MDL models should resolve to this table (two-phase init).
     #[pyo3(signature = (name, path))]
     pub fn register_parquet(
         &self,
@@ -430,7 +435,6 @@ impl PySessionContext {
         let (name, path) = (name.to_owned(), path.to_owned());
         let rt = shared_runtime()?;
         py.detach(|| {
-            let _guard = self.lock_calls();
             rt.block_on(self.base_ctx.register_parquet(
                 &name,
                 &path,
@@ -441,14 +445,16 @@ impl PySessionContext {
         Ok(())
     }
 
-    /// Register a CSV file as a named table.
-    /// Tables registered on base_ctx are visible to exec_ctx via shared catalog.
+    /// Register a CSV file as a named table on the base context.
+    ///
+    /// Same visibility contract as `register_parquet`: lands in the
+    /// pre-existing default catalog (`datafusion`.`public`), visible to
+    /// derived contexts even when they were created before this call.
     #[pyo3(signature = (name, path))]
     pub fn register_csv(&self, py: Python<'_>, name: &str, path: &str) -> PyResult<()> {
         let (name, path) = (name.to_owned(), path.to_owned());
         let rt = shared_runtime()?;
         py.detach(|| {
-            let _guard = self.lock_calls();
             rt.block_on(self.base_ctx.register_csv(
                 &name,
                 &path,
@@ -460,12 +466,11 @@ impl PySessionContext {
     }
 
     /// List registered table names in the execution context.
+    ///
+    /// This is a best-effort enumeration: registrations that land during
+    /// traversal may or may not appear, but the returned list is well-formed.
     pub fn list_tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        // No block_on here, but the traversal reads the shared catalog
-        // list, so it must be ordered against catalog re-registration in
-        // transform/query/load_mdl via the same per-context lock.
         py.detach(|| {
-            let _guard = self.lock_calls();
             let catalog_names = self.exec_ctx.catalog_names();
             let mut tables = Vec::new();
             for catalog_name in &catalog_names {
@@ -481,14 +486,14 @@ impl PySessionContext {
         })
     }
 
-    /// Dry-run SQL (EXPLAIN) to validate without executing.
+    /// Explain SQL to validate its plan. An `ANALYZE`-prefixed input becomes
+    /// `EXPLAIN ANALYZE` and executes the statement.
     #[pyo3(signature = (sql))]
     pub fn dry_run(&self, py: Python<'_>, sql: &str) -> PyResult<String> {
         let sql = sql.to_owned();
         let rt = shared_runtime()?;
         let result = py
             .detach(|| {
-                let _guard = self.lock_calls();
                 rt.block_on(async {
                     let df = self.exec_ctx.sql(&format!("EXPLAIN {sql}")).await?;
                     df.collect().await
@@ -502,6 +507,12 @@ impl PySessionContext {
 
     /// Load MDL and apply semantic layer rules (two-phase init).
     /// Call this after registering physical tables to enable the semantic layer.
+    ///
+    /// Concurrency: this method takes `&mut self`, so PyO3's exclusive
+    /// borrow rejects any overlapping call on the same SessionContext with a
+    /// `RuntimeError`. Finish `register_parquet`/`register_csv` calls before
+    /// `load_mdl`, and finish `load_mdl` before issuing queries that depend
+    /// on the new MDL.
     #[pyo3(signature = (mdl_base64))]
     pub fn load_mdl(&mut self, py: Python<'_>, mdl_base64: &str) -> PyResult<()> {
         let manifest = to_manifest(mdl_base64)?;
@@ -510,7 +521,6 @@ impl PySessionContext {
         // resolve table references to real data during LocalRuntime execution.
         let rt = shared_runtime()?;
         let register_tables = py.detach(|| {
-            let _guard = self.lock_calls();
             rt.block_on(async {
                 let mut tables = HashMap::new();
                 for catalog_name in self.base_ctx.catalog_names() {
@@ -541,7 +551,6 @@ impl PySessionContext {
         );
 
         let (unparser_ctx, exec_ctx) = py.detach(|| {
-            let _guard = self.lock_calls();
             let unparser_ctx = rt
                 .block_on(apply_wren_on_ctx(
                     &self.base_ctx,
@@ -570,16 +579,6 @@ impl PySessionContext {
 }
 
 impl PySessionContext {
-    /// Take the per-context call lock. Must only be called from inside a
-    /// `py.detach(..)` closure (i.e. with the GIL released): blocking on
-    /// this lock while holding the GIL could deadlock against a thread
-    /// that holds the lock and is about to re-acquire the GIL.
-    fn lock_calls(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.call_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn register_remote_function(
         ctx: &wren_core::SessionContext,
         mut remote_function: RemoteFunction,
@@ -636,6 +635,8 @@ impl PySessionContext {
                 r.description
             FROM
                 information_schema.routines r
+            WHERE
+                r.function_type IN ('SCALAR', 'AGGREGATE', 'WINDOW')
         "#;
         let batches = ctx
             .sql(sql)
@@ -743,6 +744,7 @@ impl PySessionContext {
                 inputs i ON r.specific_name = i.specific_name
             WHERE
                 r.routine_name = '{}'
+                AND r.function_type IN ('SCALAR', 'AGGREGATE', 'WINDOW')
         "#,
             function_name
         );

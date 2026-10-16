@@ -241,6 +241,129 @@ def test_init_creates_scaffold(tmp_path):
     assert "ACTUAL database" in model_meta
 
 
+def test_init_then_build_with_non_utf8_default_encoding(
+    tmp_path, cp1252_default_encoding
+):
+    result = runner.invoke(app, ["context", "init", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.exception
+
+    result = runner.invoke(app, ["context", "build", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.exception
+    agents_md = (tmp_path / "AGENTS.md").read_bytes().decode("utf-8")
+    assert "→" in agents_md
+
+
+def test_init_from_mdl_then_build_keeps_non_ascii_with_non_utf8_default_encoding(
+    tmp_path, cp1252_default_encoding
+):
+    mdl = {
+        "name": "shop",
+        "catalog": "wren",
+        "schema": "public",
+        "dataSource": "postgres",
+        "models": [
+            {
+                "name": "orders",
+                "tableReference": {"schema": "public", "table": "orders"},
+                "columns": [{"name": "id", "type": "INTEGER"}],
+                "primaryKey": "id",
+                "properties": {"description": "訂單 — café"},
+            }
+        ],
+    }
+    mdl_file = tmp_path / "mdl.json"
+    mdl_file.write_bytes(json.dumps(mdl, ensure_ascii=False).encode("utf-8"))
+    project = tmp_path / "project"
+
+    result = runner.invoke(
+        app,
+        ["context", "init", "--path", str(project), "--from-mdl", str(mdl_file)],
+    )
+    assert result.exit_code == 0, result.exception
+    result = runner.invoke(app, ["context", "build", "--path", str(project)])
+    assert result.exit_code == 0, result.exception
+
+    built = json.loads((project / "target" / "mdl.json").read_bytes().decode("utf-8"))
+    assert built["models"][0]["properties"]["description"] == "訂單 — café"
+
+
+def test_init_from_built_mdl_then_build(tmp_path):
+    """A target/mdl.json has no project name; the import names it after its dir."""
+    source = tmp_path / "source"
+    result = runner.invoke(app, ["context", "init", "--path", str(source)])
+    assert result.exit_code == 0, result.exception
+    result = runner.invoke(app, ["context", "build", "--path", str(source)])
+    assert result.exit_code == 0, result.exception
+    mdl_file = source / "target" / "mdl.json"
+    assert "name" not in json.loads(mdl_file.read_text(encoding="utf-8"))
+
+    project = tmp_path / "shop"
+    result = runner.invoke(
+        app,
+        ["context", "init", "--path", str(project), "--from-mdl", str(mdl_file)],
+    )
+    assert result.exit_code == 0, result.exception
+
+    result = runner.invoke(app, ["context", "build", "--path", str(project)])
+    assert result.exit_code == 0, result.output
+    config = yaml.safe_load((project / "wren_project.yml").read_text(encoding="utf-8"))
+    assert config["name"] == "shop"
+
+
+def test_init_from_mdl_with_blank_name_uses_directory_name(tmp_path):
+    """``"name": null`` or ``""`` in the MDL falls back like a missing name."""
+    for blank in (None, ""):
+        mdl_file = tmp_path / "mdl.json"
+        mdl_file.write_text(
+            json.dumps(
+                {
+                    "name": blank,
+                    "catalog": "wren",
+                    "schema": "public",
+                    "dataSource": "postgres",
+                }
+            ),
+            encoding="utf-8",
+        )
+        project = tmp_path / "shop"
+        result = runner.invoke(
+            app,
+            [
+                "context",
+                "init",
+                "--path",
+                str(project),
+                "--from-mdl",
+                str(mdl_file),
+                "--force",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        config = yaml.safe_load(
+            (project / "wren_project.yml").read_text(encoding="utf-8")
+        )
+        assert config["name"] == "shop"
+        result = runner.invoke(app, ["context", "validate", "--path", str(project)])
+        assert result.exit_code == 0, result.output
+
+
+def test_init_from_mdl_with_dot_path_uses_directory_name(tmp_path, monkeypatch):
+    """``--path .`` names the project after the resolved current directory."""
+    mdl_file = tmp_path / "mdl.json"
+    mdl_file.write_text(
+        json.dumps({"catalog": "wren", "schema": "public"}), encoding="utf-8"
+    )
+    project = tmp_path / "shop"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    result = runner.invoke(
+        app, ["context", "init", "--path", ".", "--from-mdl", str(mdl_file)]
+    )
+    assert result.exit_code == 0, result.output
+    config = yaml.safe_load((project / "wren_project.yml").read_text(encoding="utf-8"))
+    assert config["name"] == "shop"
+
+
 def test_init_refuses_existing(tmp_path):
     (tmp_path / "wren_project.yml").write_text("name: existing\n")
     result = runner.invoke(app, ["context", "init", "--path", str(tmp_path)])
@@ -460,6 +583,19 @@ def test_validate_strict_warns(tmp_path):
     assert result.exit_code == 1
 
 
+def test_validate_summary_counts_errors(tmp_path):
+    _make_valid_project(tmp_path)
+    project_file = tmp_path / "wren_project.yml"
+    project_file.write_text(project_file.read_text().replace("name: test_proj\n", ""))
+    model_meta = tmp_path / "models" / "orders" / "metadata.yml"
+    model_meta.write_text(model_meta.read_text() + "dialect: postgres\n")
+
+    result = runner.invoke(app, ["context", "validate", "--path", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "missing required field 'name'" in result.output
+    assert "1 warning(s), 1 error(s)." in result.output
+
+
 def _write_null_models_relationship(tmp_path: Path) -> None:
     # A relationship whose `models:` is an explicit YAML null. `.get("models", [])`
     # returns None (not the default) for a present-but-null key, so iterating /
@@ -657,6 +793,23 @@ def test_upgrade_cli_explicit_to_version(tmp_path):
     assert "Upgrade complete" in result.output
     config = yaml.safe_load((tmp_path / "wren_project.yml").read_text())
     assert config["schema_version"] == 2
+
+
+def test_upgrade_cli_handles_apply_upgrade_error_cleanly(tmp_path, monkeypatch):
+    _make_v1_project(tmp_path)
+
+    import wren.context as context_mod  # noqa: PLC0415
+
+    def _broken_apply(*_args, **_kwargs):
+        raise context_mod.UpgradeError("simulated apply-time failure")
+
+    monkeypatch.setattr(context_mod, "apply_upgrade", _broken_apply)
+
+    result = runner.invoke(app, ["context", "upgrade", "--path", str(tmp_path)])
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert "Error: simulated apply-time failure" in result.output
 
 
 def test_upgrade_cli_v4_to_v5_builds_knowledge(tmp_path):

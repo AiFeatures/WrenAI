@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.5.0](https://github.com/Canner/WrenAI/compare/wren-semantic-core-v0.4.0...wren-semantic-core-v0.5.0) (2026-10-14)
+
+
+### Features
+
+* **core:** support pluggable access control providers ([#2749](https://github.com/Canner/WrenAI/issues/2749)) ([f4bfb20](https://github.com/Canner/WrenAI/commit/f4bfb208f9bbd965967278647c4b987b94aded9f))
+* **wren:** add StarRocks as a first-class data source ([#2790](https://github.com/Canner/WrenAI/issues/2790)) ([4e1c25e](https://github.com/Canner/WrenAI/commit/4e1c25ecfbe7dfc6fabfb668a704203fe46018a2))
+
+
+### Bug Fixes
+
+* **core:** keep explicit ROWS window frames in planned SQL ([#2792](https://github.com/Canner/WrenAI/issues/2792)) ([13e8bd3](https://github.com/Canner/WrenAI/commit/13e8bd3654534c528715e0bb6fa687caca25ebd4))
+* **core:** preserve string literals when removing MDL qualifiers ([#2762](https://github.com/Canner/WrenAI/issues/2762)) ([7b74af1](https://github.com/Canner/WrenAI/commit/7b74af177ea9a0ad387175dd7849ea7ad30c73da))
+
+## [0.4.0](https://github.com/Canner/WrenAI/compare/wren-semantic-core-v0.3.2...wren-semantic-core-v0.4.0) (2026-09-09)
+
+
+### Features
+
+* **core:** support ordered cube queries ([#2677](https://github.com/Canner/WrenAI/issues/2677)) ([8d23753](https://github.com/Canner/WrenAI/commit/8d23753e1e4bd2198064d8c55ddca9d688aec731))
+
+
+### Bug Fixes
+
+* **core:** reject collapsed relationship joins ([#2697](https://github.com/Canner/WrenAI/issues/2697)) ([4000bea](https://github.com/Canner/WrenAI/commit/4000bea0536615a3c950c1f26cc65a55bb13cee4))
+
+## [0.3.2](https://github.com/Canner/WrenAI/compare/wren-semantic-core-v0.3.1...wren-semantic-core-v0.3.2) (2026-08-31)
+
+
+### Bug Fixes
+
+* **wren-core:** resolve relationship handles by the model they point at ([#2661](https://github.com/Canner/WrenAI/issues/2661)) ([a8a0778](https://github.com/Canner/WrenAI/commit/a8a07788a569c01df0dda391e7ecd1b6fc6316e1))
+
+## [0.3.1](https://github.com/Canner/WrenAI/compare/wren-semantic-core-v0.3.0...wren-semantic-core-v0.3.1) (2026-08-10)
+
+
+### Bug Fixes
+
+* **core:** keep RLAC cycle-detection state per analyzer invocation ([#2619](https://github.com/Canner/WrenAI/issues/2619)) ([d754985](https://github.com/Canner/WrenAI/commit/d754985ffe9040d7eaed9d079fbe6bae2e4d69b4))
+
 ## [0.3.0](https://github.com/Canner/WrenAI/compare/wren-semantic-core-v0.2.0...wren-semantic-core-v0.3.0) (2026-07-20)
 
 

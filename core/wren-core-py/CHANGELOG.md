@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.8.1](https://github.com/Canner/WrenAI/compare/wren-core-py-v0.8.0...wren-core-py-v0.8.1) (2026-10-14)
+
+
+### Dependencies
+
+* **core:** upgrade DataFusion to 55.1 ([#2766](https://github.com/Canner/WrenAI/issues/2766)) ([563058a](https://github.com/Canner/WrenAI/commit/563058a9b7da5b2a97fbdc70f6d3774d74b16350))
+
+## [0.8.0](https://github.com/Canner/WrenAI/compare/wren-core-py-v0.7.6...wren-core-py-v0.8.0) (2026-09-10)
+
+
+### Features
+
+* **core:** support ordered cube queries ([#2677](https://github.com/Canner/WrenAI/issues/2677)) ([8d23753](https://github.com/Canner/WrenAI/commit/8d23753e1e4bd2198064d8c55ddca9d688aec731))
+
+## [0.7.6](https://github.com/Canner/WrenAI/compare/wren-core-py-v0.7.5...wren-core-py-v0.7.6) (2026-08-31)
+
+
+### Bug Fixes
+
+* **bindings:** build against wren-core 0.3.2 ([#2708](https://github.com/Canner/WrenAI/issues/2708)) ([2b0543d](https://github.com/Canner/WrenAI/commit/2b0543d586d9a0d2ab23236ac8f93aaa325ea911))
+
+## [0.7.5](https://github.com/Canner/WrenAI/compare/wren-core-py-v0.7.4...wren-core-py-v0.7.5) (2026-08-17)
+
+
+### Performance Improvements
+
+* **core-py:** remove per-context call lock for same-context concurrency ([#2666](https://github.com/Canner/WrenAI/issues/2666)) ([28920e7](https://github.com/Canner/WrenAI/commit/28920e7e2689fa1af0494742fcc19edba42399ab))
+
+## [0.7.4](https://github.com/Canner/WrenAI/compare/wren-core-py-v0.7.3...wren-core-py-v0.7.4) (2026-08-11)
+
+
+### Bug Fixes
+
+* **core-py:** declare the engine version the bindings build against ([#2659](https://github.com/Canner/WrenAI/issues/2659)) ([92cdf43](https://github.com/Canner/WrenAI/commit/92cdf4395225bc043ca0b4c26fe675b0de8a63ba))
+
+## [0.7.3](https://github.com/Canner/WrenAI/compare/wren-core-py-v0.7.2...wren-core-py-v0.7.3) (2026-07-28)
+
+
+### Bug Fixes
+
+* **core-py:** serialize query results with the execution stream schema ([#2577](https://github.com/Canner/WrenAI/issues/2577)) ([1c9ae18](https://github.com/Canner/WrenAI/commit/1c9ae18c543020b43df974d7ad01189e5814ce07))
+
 ## [0.7.2](https://github.com/Canner/WrenAI/compare/wren-core-py-v0.7.1...wren-core-py-v0.7.2) (2026-07-20)
 
 

@@ -37,6 +37,7 @@ from wren.model import (
     S3FileConnectionInfo,
     SnowflakeConnectionInfo,
     SparkConnectionInfo,
+    StarRocksConnectionInfo,
     TrinoConnectionInfo,
 )
 
@@ -65,6 +66,7 @@ DATASOURCE_MODELS: dict[str, list[type[BaseConnectionInfo]]] = {
     "s3_file": [S3FileConnectionInfo],
     "snowflake": [SnowflakeConnectionInfo],
     "spark": [SparkConnectionInfo],
+    "starrocks": [StarRocksConnectionInfo],
     "trino": [TrinoConnectionInfo],
     "connection_url": [ConnectionUrl],
 }
@@ -94,14 +96,14 @@ _MODEL_UI_OVERRIDES: dict[str, dict[str, dict]] = {
         "credentials": {
             "input_type": "file_base64",
             "accept": ".json",
-            "hint": "Upload your GCP service account credentials.json file. It will be base64-encoded automatically.",
+            "hint": "Upload your GCP service account credentials.json file (it will be base64-encoded automatically), or leave blank to use Application Default Credentials.",
         },
     },
     "BigQueryProjectConnectionInfo": {
         "credentials": {
             "input_type": "file_base64",
             "accept": ".json",
-            "hint": "Upload your GCP service account credentials.json file. It will be base64-encoded automatically.",
+            "hint": "Upload your GCP service account credentials.json file (it will be base64-encoded automatically), or leave blank to use Application Default Credentials.",
         },
     },
     "SnowflakeConnectionInfo": {

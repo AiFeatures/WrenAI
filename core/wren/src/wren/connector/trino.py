@@ -19,7 +19,7 @@ import sqlglot.errors
 from loguru import logger
 from sqlglot.expressions import ColumnDef, DataType
 
-from wren.connector.base import ConnectorABC, strip_trailing_semicolon
+from wren.connector.base import ConnectorABC, coerce_limit
 from wren.model.error import (
     DIALECT_SQL,
     ErrorCode,
@@ -482,12 +482,18 @@ class TrinoConnector(ConnectorABC):
         self._closed = False
 
     def query(self, sql: str, limit: int | None = None) -> pa.Table:
+        limit = coerce_limit(limit)
         trino = _import_trino()
 
+        # Align unlimited execute with other connectors (mysql/mssql/etc.):
+        # strip a terminating `;` before send. Limited composition still needs
+        # a clean inner SQL so `;` cannot break the subquery wrap.
+        sql = self._strip(sql)
         if limit is not None:
-            sql = (
-                f"SELECT * FROM ({strip_trailing_semicolon(sql)}) AS _sub LIMIT {limit}"
-            )
+            # Multiline wrap so a trailing `-- line comment` in the inner SQL
+            # is terminated by the newline instead of swallowing the closing
+            # `) AS _sub LIMIT n` (same technique as postgres.py).
+            sql = f"SELECT * FROM (\n{sql}\n) AS _sub LIMIT {limit}"
         try:
             with contextlib.closing(self.connection.cursor()) as cursor:
                 cursor.execute(sql)
@@ -507,7 +513,7 @@ class TrinoConnector(ConnectorABC):
     def dry_run(self, sql: str) -> None:
         trino = _import_trino()
 
-        wrapped = f"SELECT * FROM ({strip_trailing_semicolon(sql)}) AS _sub LIMIT 0"
+        wrapped = f"SELECT * FROM (\n{self._strip(sql)}\n) AS _sub LIMIT 0"
         try:
             with contextlib.closing(self.connection.cursor()) as cursor:
                 cursor.execute(wrapped)

@@ -2,7 +2,7 @@ use crate::logical_plan::analyze::access_control::validate_clac_rule;
 use crate::logical_plan::error::WrenError;
 use crate::logical_plan::utils::{from_qualified_name_str, try_map_data_type};
 use crate::mdl::builder::ManifestBuilder;
-use crate::mdl::context::{apply_wren_on_ctx, Mode, WrenDataSource};
+use crate::mdl::context::{apply_wren_on_ctx_with_access_control, Mode, WrenDataSource};
 use crate::mdl::dialect::inner_dialect::get_inner_dialect;
 use crate::mdl::function::{
     ByPassAggregateUDF, ByPassScalarUDF, ByPassWindowFunction, FunctionType,
@@ -11,8 +11,10 @@ use crate::mdl::function::{
 use crate::mdl::manifest::{Column, Manifest, Model, View};
 use crate::mdl::utils::{dequote_identifier, quoted, to_field};
 use crate::DataFusionError;
+use crate::{AccessControlProvider, WrenAccessControlProvider};
 use context::SessionPropertiesRef;
 use datafusion::arrow::datatypes::Field;
+use datafusion::common::TableReference;
 use datafusion::common::{internal_datafusion_err, plan_err};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
@@ -21,10 +23,12 @@ use datafusion::execution::{SessionStateBuilder, SessionStateDefaults};
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::DFParser;
-use datafusion::sql::sqlparser::ast::{Expr, ExprWithAlias, Ident};
+use datafusion::sql::sqlparser::ast::{
+    visit_expressions_mut, visit_relations_mut, Expr, ExprWithAlias, Function, Ident,
+    Statement, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowType,
+};
 use datafusion::sql::sqlparser::dialect::dialect_from_str;
 use datafusion::sql::unparser::Unparser;
-use datafusion::sql::TableReference;
 pub use dataset::Dataset;
 use dialect::WrenDialect;
 use log::{debug, info, warn};
@@ -39,7 +43,7 @@ pub mod builder {
 }
 pub mod context;
 pub(crate) mod cube;
-pub use cube::{cube_query_to_sql, CubeQuery};
+pub use cube::{cube_query_to_sql, CubeOrderBy, CubeQuery, SortDirection};
 pub(crate) mod dataset;
 mod dialect;
 pub mod function;
@@ -87,6 +91,17 @@ impl AnalyzedWrenMDL {
         lineage::validate_cubes(&wren_mdl)?;
         let lineage = Arc::new(lineage::Lineage::new(&wren_mdl)?);
         Ok(AnalyzedWrenMDL { wren_mdl, lineage })
+    }
+
+    /// Infer the complete physical source schema for custom access control.
+    ///
+    /// This only prepares types and lineage; it does not authorize queries.
+    /// Apply a provider using `apply_wren_on_ctx_with_access_control` or
+    /// `transform_sql_with_ctx_with_access_control` before planning a query.
+    /// Keeping physical columns here lets the selected provider replace MDL
+    /// column rules, instead of inheriting columns removed by those rules.
+    pub fn analyze_with_unfiltered_schema(manifest: Manifest) -> Result<Self> {
+        Self::analyze(manifest, Arc::new(HashMap::new()), Mode::PermissionAnalyze)
     }
 
     pub fn analyze_with_tables(
@@ -458,9 +473,10 @@ pub fn create_wren_ctx(
     SessionContext::new_with_state(builder.build())
 }
 
-/// Transform the SQL based on the MDL (sync wrapper, requires multi-thread tokio runtime).
+/// Transform SQL using MDL rules in a newly created multi-thread Tokio runtime.
 ///
 /// Not available on WASM — use [`transform_sql_with_ctx`] directly in async context.
+/// Returns an error when called from an active Tokio runtime.
 #[cfg(feature = "multi-thread")]
 pub fn transform_sql(
     analyzed_mdl: Arc<AnalyzedWrenMDL>,
@@ -468,13 +484,43 @@ pub fn transform_sql(
     properties: HashMap<String, Option<String>>,
     sql: &str,
 ) -> Result<String> {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(transform_sql_with_ctx(
+    transform_sql_with_access_control(
+        analyzed_mdl,
+        remote_functions,
+        properties,
+        sql,
+        Arc::new(WrenAccessControlProvider),
+    )
+}
+
+/// Synchronous SQL generation with an explicit provider in a new Tokio runtime.
+///
+/// Returns an error if a Tokio runtime is already active, runtime creation fails,
+/// or SQL planning fails. Async callers should use
+/// [`transform_sql_with_ctx_with_access_control`], which is available on all targets.
+#[cfg(feature = "multi-thread")]
+pub fn transform_sql_with_access_control(
+    analyzed_mdl: Arc<AnalyzedWrenMDL>,
+    remote_functions: &[RemoteFunction],
+    properties: HashMap<String, Option<String>>,
+    sql: &str,
+    access_control: Arc<dyn AccessControlProvider>,
+) -> Result<String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return plan_err!(
+            "Synchronous SQL generation cannot run inside an active Tokio runtime; \
+             use transform_sql_with_ctx_with_access_control instead"
+        );
+    }
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    runtime.block_on(transform_sql_with_ctx_with_access_control(
         &create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref()),
         analyzed_mdl,
         remote_functions,
         Arc::new(properties),
         sql,
+        access_control,
     ))
 }
 
@@ -486,17 +532,43 @@ pub async fn transform_sql_with_ctx(
     properties: SessionPropertiesRef,
     sql: &str,
 ) -> Result<String> {
+    transform_sql_with_ctx_with_access_control(
+        ctx,
+        analyzed_mdl,
+        remote_functions,
+        properties,
+        sql,
+        Arc::new(WrenAccessControlProvider),
+    )
+    .await
+}
+
+/// Generate SQL with the same provider in normal planning and permission diagnostics.
+///
+/// Use [`AnalyzedWrenMDL::analyze_with_unfiltered_schema`] for inferred sources,
+/// or supply actual tables with [`AnalyzedWrenMDL::analyze_with_tables`].
+/// Unlike the default transform entrypoint, this explicitly preserves the caller's
+/// provider when rebuilding the planning context.
+pub async fn transform_sql_with_ctx_with_access_control(
+    ctx: &SessionContext,
+    analyzed_mdl: Arc<AnalyzedWrenMDL>,
+    remote_functions: &[RemoteFunction],
+    properties: SessionPropertiesRef,
+    sql: &str,
+    access_control: Arc<dyn AccessControlProvider>,
+) -> Result<String> {
     info!("wren-core received SQL: {sql}");
     remote_functions.iter().try_for_each(|remote_function| {
         debug!("Registering remote function: {remote_function:?}");
         register_remote_function(ctx, remote_function)?;
         Ok::<_, DataFusionError>(())
     })?;
-    let ctx = apply_wren_on_ctx(
+    let ctx = apply_wren_on_ctx_with_access_control(
         ctx,
         Arc::clone(&analyzed_mdl),
         Arc::clone(&properties),
         Mode::Unparse,
+        Arc::clone(&access_control),
     )
     .await?;
     let plan = match ctx.state().create_logical_plan(sql).await {
@@ -508,6 +580,7 @@ pub async fn transform_sql_with_ctx(
                 sql,
                 remote_functions,
                 properties,
+                Arc::clone(&access_control),
             )
             .await
             {
@@ -533,16 +606,55 @@ pub async fn transform_sql_with_ctx(
         )]);
     // show the planned sql
     match unparser.plan_to_sql(&analyzed) {
-        Ok(sql) => {
-            // TODO: workaround to remove unnecessary catalog and schema of mdl
-            let replaced = sql
-                .to_string()
-                .replace(analyzed_mdl.wren_mdl().catalog_schema_prefix(), "");
-            info!("wren-core planned SQL: {replaced}");
-            Ok(replaced)
+        Ok(mut sql) => {
+            let wren_mdl = analyzed_mdl.wren_mdl();
+            let _ = visit_relations_mut(&mut sql, |relation| {
+                if relation.0.len() >= 3
+                    && relation.0[0]
+                        .as_ident()
+                        .is_some_and(|ident| ident.value == wren_mdl.catalog())
+                    && relation.0[1]
+                        .as_ident()
+                        .is_some_and(|ident| ident.value == wren_mdl.schema())
+                {
+                    relation.0.drain(..2);
+                }
+                std::ops::ControlFlow::<()>::Continue(())
+            });
+            // Drop the implicit RANGE frame on the AST. An explicit ROWS or
+            // GROUPS frame with the same bounds must stay: engines that omit
+            // the frame default to RANGE and include peer rows (issue 2745).
+            strip_default_range_frame(&mut sql);
+            let sql = sql.to_string();
+            info!("wren-core planned SQL: {sql}");
+            Ok(sql)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Remove the default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`
+/// frame from window functions, leaving explicit ROWS/GROUPS frames intact.
+fn strip_default_range_frame(statement: &mut Statement) {
+    let _ = visit_expressions_mut(statement, |expr| {
+        if let Expr::Function(Function {
+            over: Some(WindowType::WindowSpec(spec)),
+            ..
+        }) = expr
+        {
+            if matches!(
+                &spec.window_frame,
+                Some(WindowFrame {
+                    units: WindowFrameUnits::Range,
+                    start_bound: WindowFrameBound::Preceding(None),
+                    end_bound: Some(WindowFrameBound::CurrentRow),
+                })
+            ) {
+                spec.window_frame = None;
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
 }
 
 /// Try to check if the fail reason is a permission denied error.
@@ -555,6 +667,7 @@ async fn permission_analyze(
     sql: &str,
     remote_functions: &[RemoteFunction],
     properties: SessionPropertiesRef,
+    access_control: Arc<dyn AccessControlProvider>,
 ) -> Result<()> {
     let ctx = create_wren_ctx(None, manifest.data_source.as_ref());
     let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
@@ -567,8 +680,14 @@ async fn permission_analyze(
         register_remote_function(&ctx, remote_function)?;
         Ok::<_, DataFusionError>(())
     })?;
-    let ctx = apply_wren_on_ctx(&ctx, analyzed_mdl, properties, Mode::PermissionAnalyze)
-        .await?;
+    let ctx = apply_wren_on_ctx_with_access_control(
+        &ctx,
+        analyzed_mdl,
+        properties,
+        Mode::PermissionAnalyze,
+        access_control,
+    )
+    .await?;
 
     let plan = match ctx.state().create_logical_plan(sql).await {
         Ok(plan) => plan,
@@ -582,16 +701,15 @@ async fn permission_analyze(
         Ok(_) => {
             info!("SQL is allowed to be planned");
         }
-        // If the error is a permission denied error, we throw it instead. Otherwise, we throw the original error.
-        Err(e) => {
-            if let DataFusionError::Context(_, ee) = &e {
-                if let DataFusionError::External(we) = ee.as_ref() {
-                    if we.downcast_ref::<WrenError>().is_some() {
-                        return Err(e);
-                    }
-                }
+        // A permission denied error, or a plan error such as a provider rejecting
+        // a whole model, explains the failure better than the original error.
+        Err(e) => match e.find_root() {
+            DataFusionError::Plan(_) => return Err(e),
+            DataFusionError::External(we) if we.downcast_ref::<WrenError>().is_some() => {
+                return Err(e)
             }
-        }
+            _ => {}
+        },
     }
     Ok(())
 }
@@ -677,6 +795,92 @@ mod test {
         ColumnLevelOperator, DataSource, JoinType, RelationshipBuilder, SessionProperty,
     };
 
+    /// An aliased model scan should build its `ModelPlanNode` once, not once as a
+    /// discarded wildcard build and once for real.
+    #[tokio::test]
+    async fn test_aliased_model_scan_builds_model_plan_node_once() -> Result<()> {
+        let test_data: PathBuf =
+            [env!("CARGO_MANIFEST_DIR"), "tests", "data", "mdl.json"]
+                .iter()
+                .collect();
+        let mdl_json = fs::read_to_string(test_data.as_path())?;
+        let mdl = match serde_json::from_str::<Manifest>(&mdl_json) {
+            Ok(mdl) => mdl,
+            Err(e) => return not_impl_err!("Failed to parse mdl json: {}", e),
+        };
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            mdl,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let ctx = create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref());
+
+        crate::logical_plan::analyze::model_anlayze::BUILD_MODEL_PLAN_NODE_CALLS
+            .with(|c| c.set(0));
+        let actual = mdl::transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            "select e.c_custkey from test.test.customer e",
+        )
+        .await?;
+        assert_eq!(
+            crate::logical_plan::analyze::model_anlayze::BUILD_MODEL_PLAN_NODE_CALLS
+                .with(|c| c.get()),
+            1,
+            "an aliased model scan should build its ModelPlanNode once, not build a \
+             throwaway wildcard node first"
+        );
+        assert_sql_valid_executable(&actual).await?;
+        assert_snapshot!(actual, @"SELECT e.c_custkey FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer) AS e");
+
+        // count(*) on an aliased model has no required columns, so it's the only
+        // remaining path that reaches the `visited_dataset` fallback (`field =
+        // vec![]`) for an aliased scan; it must still build once, not twice.
+        crate::logical_plan::analyze::model_anlayze::BUILD_MODEL_PLAN_NODE_CALLS
+            .with(|c| c.set(0));
+        let actual = mdl::transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            "select count(*) from test.test.customer e",
+        )
+        .await?;
+        assert_eq!(
+            crate::logical_plan::analyze::model_anlayze::BUILD_MODEL_PLAN_NODE_CALLS
+                .with(|c| c.get()),
+            1,
+            "count(*) on an aliased model should still build its ModelPlanNode once"
+        );
+        assert_sql_valid_executable(&actual).await?;
+        assert_snapshot!(actual, @r#"SELECT count(1) AS "count(*)" FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS e"#);
+
+        // A join of two aliased models exercises the shortcut on both sides of one
+        // walk: each aliased scan must still build its ModelPlanNode exactly once.
+        crate::logical_plan::analyze::model_anlayze::BUILD_MODEL_PLAN_NODE_CALLS
+            .with(|c| c.set(0));
+        let actual = mdl::transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            "select e.c_custkey, o.o_orderkey from test.test.customer e join test.test.orders o on e.c_custkey = o.o_custkey",
+        )
+        .await?;
+        assert_eq!(
+            crate::logical_plan::analyze::model_anlayze::BUILD_MODEL_PLAN_NODE_CALLS
+                .with(|c| c.get()),
+            2,
+            "a join of two aliased models should build each ModelPlanNode once"
+        );
+        assert_sql_valid_executable(&actual).await?;
+        assert_snapshot!(actual, @"SELECT e.c_custkey, o.o_orderkey FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer) AS e INNER JOIN (SELECT orders.o_custkey, orders.o_orderkey FROM (SELECT __source.o_custkey AS o_custkey, __source.o_orderkey AS o_orderkey FROM orders AS __source) AS orders) AS o ON e.c_custkey = o.o_custkey");
+
+        Ok(())
+    }
+
     #[cfg(feature = "multi-thread")]
     #[test]
     fn test_sync_transform() -> Result<()> {
@@ -746,6 +950,46 @@ mod test {
             println!("After transform: {actual}");
             assert_sql_valid_executable(&actual).await?;
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transform_sql_preserves_catalog_schema_prefix_in_string_literals(
+    ) -> Result<()> {
+        let test_data: PathBuf =
+            [env!("CARGO_MANIFEST_DIR"), "tests", "data", "mdl.json"]
+                .iter()
+                .collect();
+        let mdl_json = fs::read_to_string(test_data.as_path())?;
+        let mdl = serde_json::from_str::<Manifest>(&mdl_json).unwrap();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            mdl,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let ctx = create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref());
+
+        let actual = transform_sql_with_ctx(
+            &ctx,
+            analyzed_mdl,
+            &[],
+            Arc::new(HashMap::new()),
+            "SELECT 'test.test.keep' AS marker, \
+             CASE WHEN c_name LIKE 'test.test.%' \
+             THEN 'test.test.match' ELSE 'test.test.miss' END AS category, \
+             c_custkey FROM test.test.customer",
+        )
+        .await?;
+
+        assert!(actual.contains("'test.test.keep'"), "actual SQL: {actual}");
+        assert!(
+            actual.contains("LIKE 'test.test.%'"),
+            "actual SQL: {actual}"
+        );
+        assert!(actual.contains("'test.test.match'"), "actual SQL: {actual}");
+        assert!(actual.contains("'test.test.miss'"), "actual SQL: {actual}");
+        assert!(!actual.contains("FROM test.test."), "actual SQL: {actual}");
 
         Ok(())
     }
@@ -855,6 +1099,56 @@ mod test {
             @"SELECT \"Customer\".\"Custkey\", \"Customer\".\"Name\" FROM \
             (SELECT \"Customer\".\"Custkey\", \"Customer\".\"Name\" FROM \
             (SELECT __source.\"Custkey\" AS \"Custkey\", __source.\"Name\" AS \"Name\" FROM datafusion.\"public\".customer AS __source) AS \"Customer\") AS \"Customer\"");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_list_mixed_string_numeric_prefers_string() -> Result<()> {
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_custkey", "int").build())
+                    .column(ColumnBuilder::new("c_name", "varchar").build())
+                    .build(),
+            )
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let ctx = create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref());
+
+        let sql = "select c_custkey from customer where c_name in (1, 2)";
+        let actual = mdl::transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            sql,
+        )
+        .await?;
+        assert_snapshot!(actual,
+            @"SELECT customer.c_custkey FROM (SELECT customer.c_custkey, customer.c_name FROM \
+            (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer \
+            WHERE customer.c_name IN (CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))");
+
+        let sql = "select c_custkey from customer where c_custkey in ('1', '2')";
+        let actual = mdl::transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            sql,
+        )
+        .await?;
+        assert_snapshot!(actual,
+            @"SELECT customer.c_custkey FROM (SELECT customer.c_custkey FROM \
+            (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer) AS customer \
+            WHERE CAST(customer.c_custkey AS VARCHAR) IN ('1', '2')");
         Ok(())
     }
 
@@ -1124,7 +1418,10 @@ mod test {
             .await.map_err(|e| {
                 assert_snapshot!(
                     e.to_string(),
-                    @"Schema error: No field named \"名字\". Valid fields are wren.test.artist.\"串接名字\"."
+                    @r#"
+                Schema error: No field named "名字". Did you mean 'wren.test.artist."串接名字"'?
+                Valid fields are wren.test.artist."串接名字".
+                "#
                 )
             });
         Ok(())
@@ -2036,6 +2333,66 @@ mod test {
         Ok(())
     }
 
+    /// A relationship handle names the join locally, so it may differ from the model it
+    /// points at. Here the handle `customer` on `orders` resolves to the model `customers`.
+    #[tokio::test]
+    async fn test_calculated_column_with_aliased_relationship_handle() -> Result<()> {
+        let ctx = create_wren_ctx(None, None);
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("orders")
+                    .table_reference("orders")
+                    .column(ColumnBuilder::new("order_id", "int").build())
+                    .column(ColumnBuilder::new("customer_id", "int").build())
+                    .column(
+                        ColumnBuilder::new_relationship(
+                            "customer",
+                            "customers",
+                            "orders_customers",
+                        )
+                        .build(),
+                    )
+                    .column(
+                        ColumnBuilder::new_calculated("customer_name", "string")
+                            .expression("customer.name")
+                            .build(),
+                    )
+                    .primary_key("order_id")
+                    .build(),
+            )
+            .model(
+                ModelBuilder::new("customers")
+                    .table_reference("customers")
+                    .column(ColumnBuilder::new("customer_id", "int").build())
+                    .column(ColumnBuilder::new("name", "string").build())
+                    .primary_key("customer_id")
+                    .build(),
+            )
+            .relationship(
+                RelationshipBuilder::new("orders_customers")
+                    .model("orders")
+                    .model("customers")
+                    .join_type(JoinType::ManyToOne)
+                    .condition("orders.customer_id = customers.customer_id")
+                    .build(),
+            )
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+
+        let sql = "SELECT order_id, customer_name FROM orders";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::new(HashMap::new()), sql).await?,
+            @r#"SELECT orders.order_id, orders.customer_name FROM (SELECT __relation__1."name" AS customer_name, __relation__1.order_id FROM (SELECT orders.customer_id, customers."name", orders.order_id FROM (SELECT customers.customer_id, customers."name" FROM (SELECT customers.customer_id, customers."name" FROM (SELECT __source.customer_id AS customer_id, __source."name" AS "name" FROM customers AS __source) AS customers) AS customers) AS customers RIGHT OUTER JOIN (SELECT __source.customer_id AS customer_id, __source.order_id AS order_id FROM orders AS __source) AS orders ON customers.customer_id = orders.customer_id) AS __relation__1) AS orders"#
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_rlac_with_requried_properties() -> Result<()> {
         let ctx = create_wren_ctx(None, None);
@@ -2628,28 +2985,8 @@ mod test {
     /// model is added conditionally, and `with_chain` prefers an edge from the
     /// previously visited node (falling back to the start node) so star
     /// fan-outs across multiple relationships plan correctly.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_multiple_relationship_calculated_columns() -> Result<()> {
-        // Run the transform on a dedicated thread with an enlarged stack:
-        // wren-core's plan analyzer uses deep recursion and can exceed the
-        // default 2 MiB test-thread stack when joining several relationships.
-        // Production tokio worker threads have a larger stack and are
-        // unaffected; this is not infinite recursion.
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(test_multiple_relationship_calculated_columns_inner())
-            })
-            .unwrap()
-            .join()
-            .unwrap()
-    }
-
-    async fn test_multiple_relationship_calculated_columns_inner() -> Result<()> {
         let ctx = create_wren_ctx(None, None);
 
         // dc_inventory has two distinct relationships: one to `product`, one to
@@ -2930,7 +3267,10 @@ mod test {
                 panic!("whitelist_name is hidden, it should not be selected directly")
             }
             Err(e) => {
-                assert_snapshot!(e.to_string(), @"Schema error: No field named whitelist_name. Valid fields are customer.c_custkey, customer.mock_id.")
+                assert_snapshot!(e.to_string(), @r"
+                Schema error: No field named whitelist_name.
+                Valid fields are customer.c_custkey, customer.mock_id.
+                ")
             }
         }
 
@@ -3081,7 +3421,10 @@ mod test {
             Err(e) => {
                 assert_snapshot!(
                     e.to_string(),
-                    @"Schema error: No field named c_name. Valid fields are customer.c_custkey."
+                    @r"
+                Schema error: No field named c_name.
+                Valid fields are customer.c_custkey.
+                "
                 )
             }
         }
@@ -3260,12 +3603,9 @@ mod test {
 
     #[tokio::test]
     async fn test_clac_unreferenced_column_pruned_not_denied() -> Result<()> {
-        // A CLS-protected column the query does NOT reference must be pruned,
-        // not denied — even when the model is referenced with a table alias
-        // (which builds a throwaway inner plan with empty required fields, so the
-        // model gets wildcard-expanded), and for `count(*)`. Before the fix, an
-        // aliased scan of `customer` — or `count(*)` — that never selected
-        // `c_name` still denied `customer.c_name`.
+        // A CLS-protected column the query does NOT reference must be pruned, not
+        // denied, in every scan shape (bare, aliased, count(*), wildcard). Before
+        // the fix, an aliased or count(*) scan of `customer` still denied `c_name`.
         let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -4108,6 +4448,21 @@ mod test {
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
             @"SELECT rank() OVER (PARTITION BY orders.o_custkey ORDER BY orders.o_orderdate ASC NULLS LAST) FROM (SELECT orders.o_custkey, orders.o_orderdate FROM (SELECT __source.o_custkey AS o_custkey, __source.o_orderdate AS o_orderdate FROM orders AS __source) AS orders) AS orders"
+        );
+
+        // Explicit ROWS UNBOUNDED PRECEDING .. CURRENT ROW must survive planning.
+        // Dropping it lets engines default to RANGE, which includes peer rows.
+        let sql = "SELECT sum(o_orderkey) OVER (ORDER BY o_custkey ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM orders";
+        assert_snapshot!(
+            transform_sql_with_ctx(
+                &ctx,
+                Arc::clone(&analyzed_mdl),
+                &[],
+                Arc::clone(&headers),
+                sql,
+            )
+            .await?,
+            @"SELECT sum(CAST(orders.o_orderkey AS BIGINT)) OVER (ORDER BY orders.o_custkey ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM (SELECT orders.o_custkey, orders.o_orderkey FROM (SELECT __source.o_custkey AS o_custkey, __source.o_orderkey AS o_orderkey FROM orders AS __source) AS orders) AS orders"
         );
 
         // assert generate window frame if given
@@ -5092,7 +5447,7 @@ mod test {
         use datafusion::catalog::memory::MemoryCatalogProvider;
         use datafusion::catalog::CatalogProvider;
         use datafusion::catalog::SchemaProvider;
-        use datafusion::sql::TableReference;
+        use datafusion::common::TableReference;
         use std::sync::Barrier;
         use std::thread;
 
@@ -5415,6 +5770,139 @@ mod test {
                  provider internals)"
             );
 
+            Ok(())
+        }
+    }
+
+    /// A derived context keeps one `ModelAnalyzeRule` instance for its whole
+    /// lifetime, so concurrent `optimize()` calls share it — the RLAC
+    /// cycle-detection stack must therefore be per-invocation state.
+    ///
+    /// This stress test widens the race window but remains probabilistic;
+    /// a passing run does not prove the absence of shared invocation state.
+    mod analyzer_concurrency {
+        use super::*;
+        use datafusion::common::plan_err;
+        use std::sync::Barrier;
+        use std::thread;
+
+        /// Acyclic chain: `customer`'s RLAC subquery selects from `allowed`,
+        /// so planning holds the cycle stack across the nested analysis — a
+        /// wide enough window for concurrent invocations to collide.
+        fn rlac_chain_manifest() -> Manifest {
+            ManifestBuilder::new()
+                .catalog("wren")
+                .schema("test")
+                .model(
+                    ModelBuilder::new("customer")
+                        .table_reference("customer_remote")
+                        .column(ColumnBuilder::new("c_custkey", "int").build())
+                        .add_row_level_access_control(
+                            "by_allowed",
+                            vec![SessionProperty::new_required("session_user")],
+                            "c_custkey IN (SELECT allowed_id FROM allowed WHERE allowed_user = @session_user)",
+                        )
+                        .build(),
+                )
+                .model(
+                    ModelBuilder::new("allowed")
+                        .table_reference("allowed_remote")
+                        .column(ColumnBuilder::new("allowed_id", "int").build())
+                        .column(ColumnBuilder::new("allowed_user", "string").build())
+                        .build(),
+                )
+                .build()
+        }
+
+        /// Valid (acyclic) queries planned concurrently on one shared
+        /// derived context must never report a spurious RLAC cycle.
+        ///
+        /// Derive once and share — mirrors wren-core-py's long-lived
+        /// exec_ctx. Drive plans through `SessionState::optimize`: the
+        /// Analyzer only runs there, and `transform_sql_with_ctx` builds
+        /// fresh rule instances per call — either shortcut would make the
+        /// race unobservable.
+        #[test]
+        fn concurrent_valid_rlac_queries_never_report_spurious_cycle() -> Result<()> {
+            const N_THREADS: usize = 8;
+            const ITERATIONS: usize = 50;
+            const SQL: &str = "SELECT c_custkey FROM wren.test.customer";
+
+            let base_ctx = create_wren_ctx(None, None);
+            let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+                rlac_chain_manifest(),
+                Arc::new(HashMap::default()),
+                Mode::LocalRuntime,
+            )?);
+            let headers = Arc::new(build_headers(&[(
+                "session_user".to_string(),
+                Some("'alice'".to_string()),
+            )]));
+
+            let setup_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let derived_ctx = Arc::new(setup_rt.block_on(apply_wren_on_ctx(
+                &base_ctx,
+                Arc::clone(&analyzed_mdl),
+                headers,
+                Mode::LocalRuntime,
+            ))?);
+
+            // Serial sanity check: the fixture must plan cleanly without
+            // concurrency, so any failure below is attributable to it.
+            setup_rt.block_on(async {
+                let state = derived_ctx.state();
+                let plan = state.create_logical_plan(SQL).await?;
+                state.optimize(&plan).map(|_| ())
+            })?;
+
+            let barrier = Arc::new(Barrier::new(N_THREADS));
+            let handles: Vec<_> = (0..N_THREADS)
+                .map(|tid| {
+                    let ctx = Arc::clone(&derived_ctx);
+                    let barrier = Arc::clone(&barrier);
+                    thread::Builder::new()
+                        // 8 MiB matches CI's RUST_MIN_STACK and this file's
+                        // convention for plan-analysis tests (see
+                        // test_multiple_relationship_calculated_columns):
+                        // stack-heavy debug planning can exceed Rust's
+                        // platform-dependent thread default and obscure the
+                        // concurrency check.
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || -> Result<()> {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap();
+                            barrier.wait();
+                            rt.block_on(async move {
+                                for iter in 0..ITERATIONS {
+                                    let state = ctx.state();
+                                    let plan = state.create_logical_plan(SQL).await?;
+                                    // Propagate optimizer failures through
+                                    // the thread's `Result`: a panic reaches
+                                    // `join()` as `Box<dyn Any>` and loses
+                                    // this diagnostic context.
+                                    if let Err(e) = state.optimize(&plan) {
+                                        return plan_err!(
+                                            "thread {tid} iter {iter}: valid \
+                                             acyclic RLAC query failed under \
+                                             same-context concurrency: {e}"
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            })
+                        })
+                        .expect("failed to spawn analyzer stress thread")
+                })
+                .collect();
+
+            for handle in handles {
+                handle.join().expect("analyzer stress thread panicked")?;
+            }
             Ok(())
         }
     }

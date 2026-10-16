@@ -345,6 +345,7 @@ wren cube query \
   --dimensions status \
   --time-dimension "order_date:month:2024-01-01,2025-01-01" \
   --filter "status:eq:completed" \
+  --order-by "total:desc" \
   --limit 100
 ```
 
@@ -361,8 +362,9 @@ cat query.json | wren cube query --from -
 | `--dimensions` | Comma-separated dimension names |
 | `--time-dimension` | `<name>:<granularity>[:start,end]` — one time dimension with optional date range |
 | `--filter` | Repeatable. `<dimension>:<operator>[:value]`. For `in` / `not_in`, value is comma-separated. |
+| `--order-by` | Repeatable. `<member>:<direction>` where direction is `asc` or `desc`; comma-separated for multiple. The member must be selected by the query. |
 | `--limit` / `--offset` | Pagination |
-| `--from <file\|->` | Load CubeQuery as JSON from a file or stdin |
+| `--from <file\|->` | Load CubeQuery as JSON from a file or stdin. It supplies the whole query, so the query-building flags above — `--order-by` included — are ignored. |
 | `--sql-only` | Print the generated SQL and exit without executing |
 | `--mdl` | Path to MDL JSON (defaults to `<project>/target/mdl.json`) |
 | `--output` | `table` (default), `json`, `csv` |
@@ -371,6 +373,11 @@ cat query.json | wren cube query --from -
 
 **Supported filter operators:** `eq`, `neq`, `in`, `not_in`, `gt`, `gte`, `lt`,
 `lte`, `contains`, `starts_with`, `is_null`, `is_not_null`.
+
+**Ordering:** `--order-by` sorts by the query's selected members, so pair it with
+`--limit` for a genuine top-N. Omitting it keeps the default ordering (by the time
+dimension when one is present). Directions are lowercase only, and a member listed
+twice — or one the query does not select — is rejected by wren-core.
 
 See the [Cube guide](../guides/cubes.md) for YAML structure and
 validation rules.
@@ -613,3 +620,158 @@ wren genbi deploy sales-overview --provider vercel --prod
   logged-out visitors by default. To make the URL public, disable it at
   Project → Settings → Deployment Protection. The deploy itself succeeded;
   the URL is just gated.
+
+---
+
+## `wren cloud` — Connect a Project to Wren Cloud
+
+Binds a local Wren project to a Wren Cloud project's git repository. **The
+binding *is* the git remote** — nothing on your machine records which project a
+directory belongs to. After binding, plain `git push` / `git pull` / `git diff`
+are the commands; none of the security depends on going through this CLI again.
+
+Two credentials, two lifetimes:
+
+- The **project API key** is durable. It is prompted for once, stored under
+  `~/.wren/cloud.yml` (mode `0600`, keyed by git host + project id), and never
+  leaves the machine except as an `Authorization` header.
+- A **git token** is a short-TTL JWT minted from that key on *every* git
+  operation, by a credential helper git invokes itself. It is never written to
+  disk, so an expired token is a non-event — nothing ever holds one long enough
+  to present it late.
+
+`--host` means different things in different commands, and only defaults where
+it names a target. On `auth add` and `create` it defaults to
+`https://cloud.getwren.ai` — pass a URL for a self-hosted deployment. On `link`
+and `auth remove` it *selects* among stored credentials and has **no** default,
+deliberately: defaulting a filter would hide a credential you do have. Either
+way, `https` is assumed when no scheme is given.
+
+`--git-host` is only for deployments where the API and the git server are on
+different hosts — a self-hosted setup with no single ingress in front of both.
+On the managed service, leave it out.
+
+### `wren cloud auth add`
+
+Store the credential git will authenticate with, and configure git to use it.
+Touches no directory, so it works before any clone exists.
+
+```bash
+wren cloud auth add --project 1234
+wren cloud auth add --project 1234 --host https://wren.internal.example.com
+```
+
+Writes a URL-scoped credential-helper entry into your **global** git config
+(there is no clone yet to write a local one into). Because the helper resolves
+which project's token to mint from the path git hands it, one entry per host
+serves every project on it.
+
+Refuses up front if the `wren` on `PATH` cannot serve the helper — a stored
+credential that git cannot use is worse than none.
+
+### `wren cloud create`
+
+Turn a Wren project you already have into a Wren Cloud project: create it,
+connect its data source, bind this directory, and push — the push is what
+deploys the models.
+
+```bash
+wren cloud create --org 42 --type BIG_QUERY --connection-info-file ./conn.json
+wren cloud create --org 42 --type POSTGRES --connection-info '{"host":"db","port":"5432","user":"u","password":"p","database":"d"}' --test-connection
+```
+
+The organization key comes from `--org-key`, the `WREN_CLOUD_ORG_KEY`
+environment variable, or a prompt. It is used only to create the project and
+mint that project's own key, and is **never** written to disk.
+
+`--type` is case-insensitive, and the names are the API's own — note the
+underscore in `BIG_QUERY`. `--connection-info` is passed through unchanged, so
+its fields are the API's too, and they differ per data source.
+
+**It is not the shape `wren profile` uses, and nothing converts between them.**
+The API wants camelCase keys, and BigQuery `credentials` as the service-account
+object; a profile has snake_case keys and `credentials` as a base64 string.
+Passing a profile export is rejected.
+
+**For the accepted types and a worked `connectionInfo` example for each, see
+[Create a project → Database connectionInfo examples](https://wrenai.readme.io/reference/post_projects#database-connectioninfo-examples).**
+That page is the source of truth; this CLI does not keep its own copy of the
+list, so a data source added there works here without a CLI release.
+
+Requirements, all checked **before** anything is created, so a refusal leaves no
+half-made project behind:
+
+- The directory is a Wren project (`wren_project.yml`) whose YAML compiles. To
+  start a brand-new project instead, create it in the Wren Cloud web UI.
+- `--type` and a connection info are both given. A project without a data source
+  is reported as still needing setup, and this CLI cannot attach one afterwards.
+- The directory is not already bound, does not sit inside another git
+  repository, and git has an identity configured.
+
+Models travel by git, not by the API: the manifest is built to validate the
+project and then discarded, and the push fires the repository's deploy hook.
+
+### `wren cloud link`
+
+Bind a directory to a project you have already run `auth add` for. Use this to
+clone a project onto a second machine, or to re-bind after `unlink`.
+
+```bash
+wren cloud link                       # current directory
+wren cloud link ./my-project --project 1234
+```
+
+Safe to re-run if a previous attempt failed partway. If the directory is
+already fully linked it says so and does not merge again — `git pull` is how you
+get updates.
+
+Names the local branch after the remote's default branch, so plain `git push`
+works afterwards. Refuses to merge one project's history into another.
+
+### `wren cloud unlink`
+
+Remove the `origin` remote. That is the entire unbind — no server call, and the
+project is untouched.
+
+```bash
+wren cloud unlink
+wren cloud unlink ./my-project --forget-key --yes
+```
+
+Your stored key is kept by default, since another directory may still be bound
+to the same project. `--forget-key` drops it too, and removes that host's
+credential-helper entry — but only once no stored login uses that host, because
+the entry is shared by every project on it.
+
+### `wren cloud auth list`
+
+Show what is stored, without showing the keys.
+
+```bash
+wren cloud auth list
+```
+
+```text
+PROJECT  API HOST (--host)          GIT HOST (git talks to)   REPO
+1234     https://cloud.getwren.ai   https://cloud.getwren.ai  org/42/1234/shared-data.git
+```
+
+Both host columns are printed because they mean different things and can
+differ. **`--host` on the other commands is the API host** — the value you gave
+`auth add`. The credential file is keyed by the *git* host instead, because
+that is all git hands the credential helper, so reading the file to find a
+value for `--host` gives you the wrong one. This command is the answer to that.
+
+No flag prints a key.
+
+### `wren cloud auth remove`
+
+Drop a stored credential. Touches no directory.
+
+```bash
+wren cloud auth remove --project 1234 --yes
+```
+
+### `wren cloud git-credential`
+
+The credential helper `auth add` wires into git. Git invokes it; you do not.

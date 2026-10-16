@@ -183,7 +183,21 @@ A relationship column declares a join path to another model:
   relationship: orders_customers
 ```
 
-Then `orders.customer.first_name` is valid SQL — the engine resolves the join automatically.
+The handle is traversed by calculated columns on the same model:
+
+```yaml
+- name: customer_name
+  type: VARCHAR
+  is_calculated: true
+  expression: "customer.first_name"    # traverses the `customer` handle
+```
+
+> **Traversing a handle directly in a query is not supported yet.**
+> `SELECT orders.customer.first_name FROM orders` fails to plan with
+> `Schema error: No field named orders.customer.first_name`, because relationship
+> columns are excluded from the schema a model registers with the engine —
+> `Model::get_physical_columns` keeps only columns whose `relationship` is unset.
+> Tracked in [#2688](https://github.com/Canner/WrenAI/issues/2688).
 
 #### Column rename via `expression`
 
@@ -368,7 +382,7 @@ Models and views support an optional `dialect` field declaring which SQL dialect
 | `dialect` omitted | Falls back to project-level `data_source`. Default. |
 | `dialect` set | Engine uses the named dialect parser for this object's SQL. |
 
-Valid dialect values: `athena`, `bigquery`, `canner`, `clickhouse`, `databricks`, `datafusion`, `doris`, `duckdb`, `gcs_file`, `local_file`, `minio_file`, `mssql`, `mysql`, `oracle`, `postgres`, `redshift`, `s3_file`, `snowflake`, `spark`, `trino`.
+Valid dialect values: `athena`, `bigquery`, `canner`, `clickhouse`, `databricks`, `datafusion`, `doris`, `duckdb`, `gcs_file`, `local_file`, `minio_file`, `mssql`, `mysql`, `oracle`, `postgres`, `redshift`, `s3_file`, `snowflake`, `spark`, `starrocks`, `trino`.
 
 ### Schema version vs layout version
 
