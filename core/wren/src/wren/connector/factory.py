@@ -1,5 +1,6 @@
 import importlib
 
+from wren.mdl.cte_rewriter import get_sqlglot_dialect
 from wren.model.data_source import DataSource
 from wren.model.error import ErrorCode, WrenError
 
@@ -7,6 +8,7 @@ _REGISTRY: dict[DataSource, str] = {
     DataSource.postgres: "wren.connector.postgres",
     DataSource.mysql: "wren.connector.mysql",
     DataSource.doris: "wren.connector.mysql",
+    DataSource.starrocks: "wren.connector.mysql",
     DataSource.mssql: "wren.connector.mssql",
     DataSource.canner: "wren.connector.canner",
     DataSource.bigquery: "wren.connector.bigquery",
@@ -29,6 +31,7 @@ _REGISTRY: dict[DataSource, str] = {
 # Map data sources to the correct pip extra when they share a connector module
 _INSTALL_EXTRA: dict[DataSource, str] = {
     DataSource.doris: "mysql",
+    DataSource.starrocks: "mysql",
     DataSource.canner: "postgres",
     DataSource.local_file: "duckdb",
     DataSource.s3_file: "duckdb",
@@ -39,6 +42,7 @@ _INSTALL_EXTRA: dict[DataSource, str] = {
 _NEEDS_DATA_SOURCE = {
     DataSource.mysql,
     DataSource.doris,
+    DataSource.starrocks,
     DataSource.trino,
 }
 
@@ -62,5 +66,13 @@ def get_connector(data_source: DataSource, connection_info):
         ) from e
 
     if data_source in _NEEDS_DATA_SOURCE:
-        return module.create_connector(data_source, connection_info)
-    return module.create_connector(connection_info)
+        connector = module.create_connector(data_source, connection_info)
+    else:
+        connector = module.create_connector(connection_info)
+
+    # Which lexical forms exist is a per-dialect property (`\'` is an escape in
+    # MySQL/BigQuery but not in standard SQL), and the DataSource is only known
+    # here -- so the strip helpers get the dialect from the factory rather than
+    # hard-coding it per connector.
+    connector.dialect = get_sqlglot_dialect(data_source)
+    return connector

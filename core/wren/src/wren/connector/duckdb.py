@@ -4,7 +4,7 @@ import opendal
 import pyarrow as pa
 from loguru import logger
 
-from wren.connector.base import ConnectorABC, strip_trailing_semicolon
+from wren.connector.base import ConnectorABC, coerce_limit
 from wren.model import (
     GcsFileConnectionInfo,
     MinioFileConnectionInfo,
@@ -81,10 +81,14 @@ class DuckDBConnector(ConnectorABC):
         Trailing statement terminators are always stripped so client-pasted
         ``SELECT …;`` behaves the same on limited and unlimited paths.
         """
-        stripped = strip_trailing_semicolon(sql)
+        limit = coerce_limit(limit)
+        stripped = self._strip(sql)
         if limit is not None:
             # Subquery wrap rejects an interior terminator after strip.
-            sql = f"SELECT * FROM ({stripped}) AS _q LIMIT {int(limit)}"
+            # Multiline so a trailing `-- line comment` in `stripped` is
+            # terminated by the newline instead of swallowing the closing
+            # `) AS _q LIMIT n` (same technique as postgres.py/athena.py).
+            sql = f"SELECT * FROM (\n{stripped}\n) AS _q LIMIT {limit}"
         else:
             sql = stripped
         return self.connection.execute(sql).fetch_arrow_table()
@@ -100,8 +104,8 @@ class DuckDBConnector(ConnectorABC):
         statement then becomes a natural syntax error inside the subquery, and
         no rows are materialized.
         """
-        stripped = strip_trailing_semicolon(sql)
-        self.connection.execute(f"SELECT * FROM ({stripped}) AS _q LIMIT 0")
+        stripped = self._strip(sql)
+        self.connection.execute(f"SELECT * FROM (\n{stripped}\n) AS _q LIMIT 0")
 
     def _attach_database(self, connection_info) -> None:
         """Attach every discovered DuckDB file as a read-only database.

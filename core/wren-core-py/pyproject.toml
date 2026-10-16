@@ -1,6 +1,6 @@
 [project]
 name = "wren-core-py"
-version = "0.7.2"
+version = "0.8.1"
 description = "Python bindings for Wren Engine semantic layer (wren-core)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,7 @@ Issues = "https://github.com/Canner/WrenAI/issues"
 [dependency-groups]
 dev = [
   "maturin==1.9.4",
+  "pyarrow==25.0.0",
   "pytest==9.1.1",
   "ruff==0.13.1",
 ]
@@ -46,6 +47,8 @@ build-backend = "maturin"
 line-length = 88
 target-version = "py311"
 exclude = ["tools/"]
+# ruff 0.16+ formats Markdown code blocks by default; docs are hand-formatted.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [

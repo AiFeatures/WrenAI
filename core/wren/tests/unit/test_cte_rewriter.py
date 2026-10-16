@@ -113,6 +113,23 @@ def _make_rewriter(
     return CTERewriter(manifest_str, session, data_source, fallback=fallback)
 
 
+class _RecordingSessionContext:
+    """Wraps a real session context, recording every SQL string handed to
+    ``transform_sql`` so a test can see whether a model was sent as a bare
+    ``SELECT *`` (CLAC-controlled) or an explicit column list."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls: list[str] = []
+
+    def transform_sql(self, sql: str) -> str:
+        self.calls.append(sql)
+        return self._inner.transform_sql(sql)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 # ---------------------------------------------------------------------------
 # Helper: parse and check CTE presence
 # ---------------------------------------------------------------------------
@@ -237,6 +254,42 @@ class TestMultiModel:
         customer_body = _cte_body_sql(result, "customer")
         assert customer_body is not None
         assert "c_name" in customer_body.lower()
+
+
+class TestUnionStarDetection:
+    """A star anywhere in a UNION/INTERSECT/EXCEPT must route that model
+    through wren-core as ``SELECT *`` (so CLAC controls column visibility),
+    not as an explicit column list, no matter which branch it is in."""
+
+    def test_star_in_second_union_branch_still_routes_through_wren_core(self):
+        rw = _make_rewriter(_SINGLE_MODEL_MANIFEST)
+        rw.session_context = _RecordingSessionContext(rw.session_context)
+        rw.rewrite('SELECT o_orderkey FROM "orders" UNION ALL SELECT * FROM "orders"')
+        assert any(
+            s.strip() == 'SELECT * FROM "orders"' for s in rw.session_context.calls
+        ), (
+            f"expected a bare SELECT * transform_sql call, got: {rw.session_context.calls}"
+        )
+
+    def test_star_in_first_union_branch_still_detected(self):
+        rw = _make_rewriter(_SINGLE_MODEL_MANIFEST)
+        rw.session_context = _RecordingSessionContext(rw.session_context)
+        rw.rewrite('SELECT * FROM "orders" UNION ALL SELECT o_orderkey FROM "orders"')
+        assert any(
+            s.strip() == 'SELECT * FROM "orders"' for s in rw.session_context.calls
+        ), (
+            f"expected a bare SELECT * transform_sql call, got: {rw.session_context.calls}"
+        )
+
+    def test_plain_query_star_still_detected(self):
+        rw = _make_rewriter(_SINGLE_MODEL_MANIFEST)
+        rw.session_context = _RecordingSessionContext(rw.session_context)
+        rw.rewrite('SELECT * FROM "orders"')
+        assert any(
+            s.strip() == 'SELECT * FROM "orders"' for s in rw.session_context.calls
+        ), (
+            f"expected a bare SELECT * transform_sql call, got: {rw.session_context.calls}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +519,22 @@ class TestDialectMapping:
 
     def test_mssql_maps_to_tsql(self):
         assert get_sqlglot_dialect(DataSource.mssql) == "tsql"
+
+    def test_starrocks_uses_its_own_sqlglot_dialect(self):
+        # Doris and StarRocks differ in DATE_TRUNC argument order and in
+        # ARRAY_AGG / GROUP_CONCAT spelling, so StarRocks must not reuse "doris".
+        assert get_sqlglot_dialect(DataSource.starrocks) == "starrocks"
+        assert get_sqlglot_dialect(DataSource.doris) == "doris"
+
+    def test_starrocks_date_trunc_argument_order(self):
+        sql = "SELECT date_trunc('month', d) FROM t"
+        starrocks = get_sqlglot_dialect(DataSource.starrocks)
+        doris = get_sqlglot_dialect(DataSource.doris)
+        out = sqlglot.transpile(sql, read=starrocks, write=starrocks)[0]
+        assert out == "SELECT DATE_TRUNC('MONTH', d) FROM t"
+        # The doris dialect swaps the arguments, which StarRocks rejects.
+        out_doris = sqlglot.transpile(sql, read=doris, write=doris)[0]
+        assert out_doris == "SELECT DATE_TRUNC(d, 'MONTH') FROM t"
 
     def test_canner_maps_to_trino(self):
         assert get_sqlglot_dialect(DataSource.canner) == "trino"

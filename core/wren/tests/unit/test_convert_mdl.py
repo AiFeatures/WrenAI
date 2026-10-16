@@ -11,6 +11,7 @@ import yaml
 from wren.context import (
     _AGENTS_MD_TEMPLATE,
     _CAMEL_TO_SNAKE_MAP,
+    ProjectFile,
     _camel_to_snake,
     _snake_to_camel,
     build_json,
@@ -228,6 +229,63 @@ def test_write_project_files_force_overwrites(tmp_path: Path):
     assert project["schema_version"] == 2
 
 
+def test_write_project_files_force_invalid_path_preserves_existing_files(
+    tmp_path: Path,
+):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    sentinel = models_dir / "keep.txt"
+    sentinel.write_text("important")
+    escaped_path = tmp_path.parent / f"{tmp_path.name}-escape.txt"
+
+    files = [
+        ProjectFile(relative_path=f"../{escaped_path.name}", content="invalid"),
+    ]
+
+    with pytest.raises(SystemExit, match="invalid output path"):
+        write_project_files(files, tmp_path, force=True)
+
+    assert sentinel.read_text() == "important"
+    assert not escaped_path.exists()
+
+
+def test_write_project_files_preflights_all_paths_before_writing(tmp_path: Path):
+    escaped_path = tmp_path.parent / f"{tmp_path.name}-escape.txt"
+    files = [
+        ProjectFile(relative_path="models/orders/metadata.yml", content="valid"),
+        ProjectFile(relative_path=f"../{escaped_path.name}", content="invalid"),
+    ]
+
+    with pytest.raises(SystemExit, match="invalid output path"):
+        write_project_files(files, tmp_path)
+
+    assert not (tmp_path / "models").exists()
+    assert not escaped_path.exists()
+
+
+@pytest.mark.parametrize("relative_path", ["", ".", "models/.."])
+def test_write_project_files_force_root_target_preserves_existing_files(
+    tmp_path: Path,
+    relative_path: str,
+):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    sentinel = models_dir / "keep.txt"
+    sentinel.write_text("important")
+
+    with pytest.raises(SystemExit) as exc_info:
+        write_project_files(
+            [ProjectFile(relative_path=relative_path, content="invalid")],
+            tmp_path,
+            force=True,
+        )
+
+    assert str(exc_info.value) == f"Error: invalid output path: {relative_path!r}"
+    assert tmp_path.is_dir()
+    assert sentinel.read_text() == "important"
+    assert set(tmp_path.rglob("*")) == {models_dir, sentinel}
+
+
 # ── Round-trip: convert → build ────────────────────────────────────────────
 
 
@@ -252,6 +310,85 @@ def test_convert_then_build_roundtrip(tmp_path: Path):
     assert rel["joinType"] == "MANY_TO_ONE"
 
 
+def test_convert_then_build_roundtrip_keeps_cubes(tmp_path: Path):
+    """Cubes in the imported MDL are written to cubes/ and survive a rebuild."""
+    cube = {
+        "name": "order_metrics",
+        "baseObject": "orders",
+        "measures": [
+            {"name": "revenue", "expression": "SUM(total)", "type": "DECIMAL"}
+        ],
+        "dimensions": [
+            {"name": "customer_id", "expression": "customer_id", "type": "INTEGER"}
+        ],
+        "timeDimensions": [
+            {"name": "ordered_at", "expression": "order_date", "type": "DATE"}
+        ],
+    }
+    files = convert_mdl_to_project({**SAMPLE_MDL, "layoutVersion": 3, "cubes": [cube]})
+    assert "cubes/order_metrics/metadata.yml" in {f.relative_path for f in files}
+    write_project_files(files, tmp_path)
+
+    assert build_json(tmp_path)["cubes"] == [cube]
+
+
+def test_write_project_files_force_removes_stale_cubes(tmp_path: Path):
+    """A forced re-import drops cubes that are not in the new MDL."""
+    cube = {"name": "order_metrics", "baseObject": "orders"}
+    write_project_files(
+        convert_mdl_to_project({**SAMPLE_MDL, "layoutVersion": 3, "cubes": [cube]}),
+        tmp_path,
+    )
+    assert (tmp_path / "cubes" / "order_metrics" / "metadata.yml").exists()
+
+    write_project_files(
+        convert_mdl_to_project({**SAMPLE_MDL, "layoutVersion": 3}),
+        tmp_path,
+        force=True,
+        extra_managed_paths=("cubes",),
+    )
+
+    assert not (tmp_path / "cubes").exists()
+    assert not build_json(tmp_path).get("cubes")
+
+
+def test_write_project_files_force_keeps_unmanaged_cubes(tmp_path: Path):
+    """A forced write that does not claim cubes/ (e.g. dbt import) keeps it."""
+    cube_file = tmp_path / "cubes" / "order_metrics" / "metadata.yml"
+    cube_file.parent.mkdir(parents=True)
+    cube_file.write_text("name: order_metrics")
+
+    write_project_files(
+        [ProjectFile(relative_path="models/orders/metadata.yml", content="new")],
+        tmp_path,
+        force=True,
+    )
+
+    assert cube_file.read_text() == "name: order_metrics"
+    assert (tmp_path / "models" / "orders" / "metadata.yml").read_text() == "new"
+
+
+def test_write_project_files_rejects_duplicate_paths(tmp_path: Path):
+    cube = {"name": "order_metrics", "baseObject": "orders"}
+    files = convert_mdl_to_project(
+        {**SAMPLE_MDL, "layoutVersion": 3, "cubes": [cube, cube]}
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        write_project_files(files, tmp_path)
+
+    assert str(exc_info.value) == (
+        "Error: duplicate output path: 'cubes/order_metrics/metadata.yml'"
+    )
+    assert not any(tmp_path.iterdir())
+
+
+def test_convert_cube_missing_name_raises():
+    mdl = {"catalog": "wren", "schema": "public", "cubes": [{"baseObject": "orders"}]}
+    with pytest.raises(ValueError, match="Cube at index 0"):
+        convert_mdl_to_project(mdl)
+
+
 # ── Edge cases ─────────────────────────────────────────────────────────────
 
 
@@ -262,6 +399,25 @@ def test_empty_mdl():
     paths = {f.relative_path for f in files}
     assert paths == {"wren_project.yml", "AGENTS.md", "knowledge/knowledge.yml"}
     assert "instructions.md" not in paths
+
+
+def test_default_name_fills_a_missing_or_blank_project_name():
+    def project_name(mdl: dict) -> str | None:
+        files = convert_mdl_to_project(mdl, default_name="fallback")
+        project_file = next(f for f in files if f.relative_path == "wren_project.yml")
+        return yaml.safe_load(project_file.content).get("name")
+
+    base = {"catalog": "wren", "schema": "public"}
+    assert project_name(base) == "fallback"
+    assert project_name({**base, "name": "shop"}) == "shop"
+    assert project_name({**base, "projectName": "legacy"}) == "legacy"
+    # A key that is present but null or empty is not a usable name.
+    for blank in (None, ""):
+        assert project_name({**base, "name": blank}) == "fallback"
+        assert project_name({**base, "projectName": blank}) == "fallback"
+        assert project_name({**base, "name": blank, "projectName": "legacy"}) == (
+            "legacy"
+        )
 
 
 def test_no_data_source():

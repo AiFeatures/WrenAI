@@ -230,9 +230,13 @@ def init(
             raise typer.Exit(1)
 
         mdl_json = json.loads(mdl_path.read_text(encoding="utf-8"))
-        files = convert_mdl_to_project(mdl_json)
+        files = convert_mdl_to_project(
+            mdl_json, default_name=project_path.resolve().name
+        )
         try:
-            write_project_files(files, project_path, force=force)
+            write_project_files(
+                files, project_path, force=force, extra_managed_paths=("cubes",)
+            )
         except SystemExit as e:
             typer.echo(str(e), err=True)
             raise typer.Exit(1)
@@ -240,10 +244,12 @@ def init(
         model_count = len(mdl_json.get("models", []))
         view_count = len(mdl_json.get("views", []))
         rel_count = len(mdl_json.get("relationships", []))
+        cube_count = len(mdl_json.get("cubes", []))
 
         typer.echo(f"Imported MDL to YAML project at {project_path}/")
         typer.echo(
-            f"  {model_count} models, {view_count} views, {rel_count} relationships"
+            f"  {model_count} models, {view_count} views, {rel_count} relationships, "
+            f"{cube_count} cubes"
         )
         typer.echo("\nNext steps:")
         typer.echo(f"  wren context validate --path {project_path}")
@@ -283,7 +289,7 @@ def init(
         "\n"
         "data_source: postgres  # change to your datasource type\n"
     )
-    project_file.write_text(project_yml)
+    project_file.write_text(project_yml, encoding="utf-8")
 
     # Empty relationships.yml (shared between empty and full scaffold)
     rels = (
@@ -297,7 +303,20 @@ def init(
         "#     join_type: MANY_TO_ONE\n"
         "#     condition: orders.customer_id = customers.customer_id\n"
     )
-    (project_path / "relationships.yml").write_text(rels)
+    (project_path / "relationships.yml").write_text(rels, encoding="utf-8")
+
+    # `wren context build` writes target/mdl.json — compiled output, derived
+    # from the YAML beside it. Without this, a project pushed to a git remote
+    # carries its own build artifact: observed with `wren cloud create`, which
+    # pushes the directory, so `target/mdl.json` ended up committed to the
+    # project's repository. Only written when absent, so a project that already
+    # has one keeps whatever it says.
+    gitignore = project_path / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(
+            "# Compiled MDL — rebuild with `wren context build`\ntarget/\n",
+            encoding="utf-8",
+        )
 
     if not empty:
         # Scaffold example model (table_reference mode)
@@ -325,7 +344,8 @@ def init(
             "    properties: {}\n"
             "primary_key: id\n"
             "cached: false\n"
-            "properties: {}\n"
+            "properties: {}\n",
+            encoding="utf-8",
         )
 
         # Scaffold example view
@@ -335,10 +355,11 @@ def init(
             "# Example view — replace with your actual view\n"
             "name: example_view\n"
             "properties:\n"
-            '  description: "An example view"\n'
+            '  description: "An example view"\n',
+            encoding="utf-8",
         )
         (example_view_dir / "sql.yml").write_text(
-            "statement: >\n  SELECT * FROM example LIMIT 100\n"
+            "statement: >\n  SELECT * FROM example LIMIT 100\n", encoding="utf-8"
         )
 
     # ── knowledge/ skeleton (first-class business context) ──
@@ -352,11 +373,12 @@ def init(
     if force or not general_rules.exists():
         general_rules.write_text(
             "# Business rules\n\n"
-            "Add custom rules or guidelines for LLM-based query generation here.\n"
+            "Add custom rules or guidelines for LLM-based query generation here.\n",
+            encoding="utf-8",
         )
 
     # ── AGENTS.md ──
-    (project_path / "AGENTS.md").write_text(_AGENTS_MD_TEMPLATE)
+    (project_path / "AGENTS.md").write_text(_AGENTS_MD_TEMPLATE, encoding="utf-8")
 
     # NL→SQL pairs live in knowledge/sql/ (written by `wren memory store`),
     # so no queries.yml is scaffolded.
@@ -523,7 +545,9 @@ def validate(
             typer.echo(f"  \u2717 {msg}", err=True)
 
     all_warnings: list[str] = [str(w) for w in struct_warnings] + list(sem_warnings)
-    _print_warnings(all_warnings, verbose=verbose)
+    _print_warnings(
+        all_warnings, verbose=verbose, errors=len(struct_hard) + len(sem_errors)
+    )
 
     # ── Exit logic ──────────────────────────────────────────────────────────────────
     has_hard_error = bool(struct_hard or sem_errors)
@@ -556,7 +580,7 @@ def validate(
         )
 
 
-def _print_warnings(warnings: list[str], *, verbose: bool) -> None:
+def _print_warnings(warnings: list[str], *, verbose: bool, errors: int = 0) -> None:
     """Render warnings: every line below the threshold, grouped summary above.
 
     Agents and humans both read the first "Warnings:" line as a signal
@@ -573,7 +597,7 @@ def _print_warnings(warnings: list[str], *, verbose: bool) -> None:
         typer.echo("\nWarnings:")
         for msg in warnings:
             typer.echo(f"  \u26a0 {msg}")
-        typer.echo(f"\n{total} warning(s), 0 errors.")
+        typer.echo(f"\n{total} warning(s), {errors} error(s).")
         return
 
     # Bucket by warning *category* — the text after the last colon
@@ -655,7 +679,9 @@ def build(
     if output:
         out_path = Path(output).expanduser()
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(manifest_json, indent=2, ensure_ascii=False))
+        out_path.write_text(
+            json.dumps(manifest_json, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
     else:
         out_path = save_target(manifest_json, project_path)
 
@@ -961,7 +987,11 @@ def upgrade(
         f"Upgrading project from schema_version {result.from_version} -> {result.to_version}..."
     )
 
-    apply_upgrade(project_path, result)
+    try:
+        apply_upgrade(project_path, result)
+    except UpgradeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
     for f in result.files_created:
         typer.echo(f"  + {f}")
@@ -1038,7 +1068,9 @@ def _init_from_osi(
 
     files = convert_mdl_to_project(mdl_json)
     try:
-        write_project_files(files, project_path, force=force)
+        write_project_files(
+            files, project_path, force=force, extra_managed_paths=("cubes",)
+        )
     except SystemExit as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
@@ -1099,7 +1131,9 @@ def _build_from_osi(
     else:
         out_path = Path.cwd() / "target" / "mdl.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(manifest_json, indent=2, ensure_ascii=False))
+    out_path.write_text(
+        json.dumps(manifest_json, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
     n_models = len(manifest_json.get("models", []))
     n_rels = len(manifest_json.get("relationships", []))
@@ -1135,7 +1169,7 @@ def _validate_from_osi(
         for e in hard:
             typer.echo(f"  ✗ {e}", err=True)
 
-    _print_warnings(warns, verbose=verbose)
+    _print_warnings(warns, verbose=verbose, errors=len(hard))
 
     if hard or (strict and warns):
         raise typer.Exit(1)
